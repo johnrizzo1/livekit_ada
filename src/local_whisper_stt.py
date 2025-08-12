@@ -1,30 +1,35 @@
 """Local STT implementation using faster-whisper"""
 import asyncio
 import numpy as np
-from typing import AsyncIterable, List, Optional
-from typing import Union
-from dataclasses import dataclass
+from typing import Optional
 from faster_whisper import WhisperModel
-from livekit import agents, rtc
+from livekit import agents
 from livekit.agents import stt, APIConnectOptions
 from livekit.agents.utils import AudioBuffer
 import logging
 
+from .whisper_options import WhisperOptions
+
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class WhisperOptions:
-    model_size: str = "base"
-    device: str = "auto"
-    compute_type: str = "int8"
-    language: str = "en"
-    initial_prompt: str = None
-    vad_filter: bool = True
-    vad_parameters: dict = None
-
-
 class LocalWhisperSTT(stt.STT):
+    """Local Speech-to-Text implementation using faster-whisper.
+    
+    This class provides speech recognition capabilities using a locally-running
+    Whisper model via the faster-whisper library. It supports various model sizes,
+    devices, and compute types for flexible deployment options. The implementation
+    provides non-streaming recognition with configurable VAD filtering.
+    
+    Args:
+        model_size: Whisper model size ("tiny", "base", "small", "medium", "large")
+        device: Device to run inference on ("auto", "cpu", "cuda")
+        compute_type: Compute precision ("int8", "float16", "float32")
+        language: Target language for transcription (default: "en")
+        initial_prompt: Optional prompt to guide transcription
+        vad_filter: Whether to apply voice activity detection filtering
+    """
+    
     def __init__(
         self,
         *,
@@ -32,7 +37,7 @@ class LocalWhisperSTT(stt.STT):
         device: str = "auto",
         compute_type: str = "int8",
         language: str = "en",
-        initial_prompt: str = None,
+        initial_prompt: Optional[str] = None,
         vad_filter: bool = True,
     ):
         super().__init__(
@@ -71,8 +76,14 @@ class LocalWhisperSTT(stt.STT):
     ) -> stt.SpeechEvent:
         """Recognize speech from audio buffer"""
 
-        # Convert audio to numpy array
-        audio_data = np.frombuffer(buffer.data, dtype=np.int16).astype(np.float32)
+        # Convert audio to numpy array  
+        if isinstance(buffer, list):
+            # Handle case where buffer is a list of AudioFrames
+            raise ValueError("Buffer should be AudioBuffer, not list of frames")
+        elif hasattr(buffer, 'data'):
+            audio_data = np.frombuffer(buffer.data, dtype=np.int16).astype(np.float32)
+        else:
+            raise ValueError("Invalid buffer format - expected AudioBuffer with data attribute")
         audio_data = audio_data / 32768.0  # Normalize to [-1, 1]
 
         # Run inference in thread pool
@@ -106,6 +117,8 @@ class LocalWhisperSTT(stt.STT):
 
     def _transcribe(self, audio_data: np.ndarray, language: str):
         """Run Whisper transcription"""
+        if self._model is None:
+            raise RuntimeError("Whisper model not initialized")
         segments, info = self._model.transcribe(
             audio_data,
             beam_size=5,
@@ -118,55 +131,11 @@ class LocalWhisperSTT(stt.STT):
     def stream(
         self,
         *,
-        language: str = None,
+        language: Optional[str] = None,
     ) -> "WhisperSTTStream":
         """Create a streaming interface (uses VAD for segmentation)"""
+        from .whisper_stt_stream import WhisperSTTStream
         return WhisperSTTStream(
             stt=self,
             language=language or self._options.language,
         )
-
-
-class WhisperSTTStream(stt.SpeechStream):
-    """Stream adapter for Whisper using VAD for segmentation"""
-    
-    def __init__(self, stt: LocalWhisperSTT, language: str):
-        super().__init__()
-        self._stt = stt
-        self._language = language
-        self._audio_buffer = []
-        self._sample_rate = 16000
-        
-    async def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """Add audio frame to buffer"""
-        self._audio_buffer.append(frame)
-        
-    async def flush(self) -> None:
-        """Process buffered audio"""
-        if not self._audio_buffer:
-            return
-            
-        # Combine audio frames
-        combined_frame = rtc.combine_audio_frames(self._audio_buffer)
-        
-        # Create AudioBuffer from combined frame
-        audio_buffer = AudioBuffer(
-            data=combined_frame.data,
-            sample_rate=combined_frame.sample_rate,
-            num_channels=combined_frame.num_channels
-        )
-        
-        # Recognize the buffered audio
-        event = await self._stt.recognize(buffer=audio_buffer, language=self._language)
-        
-        # Clear buffer
-        self._audio_buffer.clear()
-        
-        # Emit the event
-        if event.alternatives:
-            self._event_queue.put_nowait(event)
-            
-    async def aclose(self) -> None:
-        """Close the stream"""
-        await self.flush()
-        await super().aclose()

@@ -5,8 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from livekit import agents
-from src.agent import entrypoint
 
+from .agent import entrypoint
 
 def main():
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))

@@ -1,334 +1,331 @@
 #!/usr/bin/env python3
-"""
-Ada Client - Voice Client with Clean Interface
-A clean voice client for interacting with Ada agent.
-"""
-import argparse
-import sys
+"""Enhanced Ada Voice Client with Rich interface and proper input handling"""
 import asyncio
-import logging
-from pathlib import Path
-from datetime import datetime
 import threading
-import queue
 import time
-from typing import Optional
+from datetime import datetime
+import argparse
+import logging
+import os
+import queue
+from typing import List, Tuple
 
-# Ensure src is in path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Rich imports for UI
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
+from rich.live import Live
+from rich import box
 
-from src.gui_voice_client import CleanVoiceClient
+# Local imports
+from src.client import VoiceClient, StatusDisplay
 
 
-class ConversationDisplay:
-    """Manages the conversation display area"""
+class ChatInterface:
+    """Chat interface with proper input handling"""
+    
     def __init__(self):
-        self.messages = []
-        self.max_messages = 50
-    
-    def add_user_message(self, text: str):
-        """Add user message to conversation"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.messages.append(f"[{timestamp}] 👤 You: {text}")
-        self._trim_messages()
-        self._refresh_display()
-    
-    def add_agent_message(self, text: str):
-        """Add agent message to conversation"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.messages.append(f"[{timestamp}] 🤖 Ada: {text}")
-        self._trim_messages()
-        self._refresh_display()
-    
-    def add_system_message(self, text: str):
-        """Add system message to conversation"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.messages.append(f"[{timestamp}] ℹ️  {text}")
-        self._trim_messages()
-        self._refresh_display()
-    
-    def _trim_messages(self):
-        """Keep only the last N messages"""
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages:]
-    
-    def _refresh_display(self):
-        """Refresh the conversation display"""
-        # Clear the conversation area (lines 5-25)
-        print("\033[5;1H")  # Move to line 5
-        print("\033[J")     # Clear from cursor to end of screen
+        self.conversation_history: List[Tuple[str, str, str]] = []  # (role, text, timestamp)
+        self.status_text = "📡 Connecting..."
+        self.text_input_queue = queue.Queue()
+        self.console = Console()
+        self.layout = Layout()
+        self.client = None
+        self.max_messages = 20
         
-        # Display recent messages
-        for message in self.messages[-15:]:  # Show last 15 messages
-            print(message)
+        self.create_layout()
         
-        # Return cursor to status area
-        print("\033[2;1H")  # Move back to status line
-
-
-class ImprovedStatusDisplay:
-    """Enhanced status display with fixed positioning"""
-    def __init__(self, conversation_display: ConversationDisplay):
-        self.mic_level = 0
-        self.is_speaking = False
-        self.agent_speaking = False
-        self.agent_listening = False
-        self.connection_status = "Connecting..."
-        self.last_update = 0
-        self.conversation = conversation_display
-        self.input_prompt = "💬 Type your message: "
-        self.setup_display()
-    
-    def update_mic_level(self, rms):
-        """Update microphone level"""
-        self.mic_level = rms
-        self.is_speaking = rms > 1000
-        self._print_status()
+    def create_layout(self):
+        """Create the layout structure"""
+        self.layout.split_column(
+            Layout(name="header", size=3),    # Title and status
+            Layout(name="main"),              # Conversation area
+            Layout(name="footer", size=5)     # Controls and input area
+        )
         
-    def set_agent_speaking(self, speaking):
-        """Set agent speaking status"""
-        self.agent_speaking = speaking
-        self._print_status()
+    def get_header_panel(self):
+        """Create header panel with title and status"""
+        header_text = Text()
+        header_text.append("🎯 Ada Voice Client - Enhanced Chat", style="bold blue")
+        header_text.append(f"\n{self.status_text}", style="green")
         
-    def set_connection_status(self, status):
-        """Set connection status"""
-        self.connection_status = status
-        self._print_status()
-    
-    def setup_display(self):
-        """Setup the terminal display layout"""
-        # Clear screen
-        print("\033[2J")
-        print("\033[H")
+        return Panel(
+            header_text,
+            title="Status",
+            border_style="blue",
+            box=box.ROUNDED
+        )
         
-        # Header
-        print("🎯 Ada Voice Client")
-        print("-" * 60)
-        print("Status: Initializing...")
-        print("-" * 60)
-        print("Conversation:")
-        print()
-        
-        # Reserve space for conversation (lines 5-25)
-        for _ in range(20):
-            print()
-        
-        print("-" * 60)
-        print("Audio Status: ")
-        print(self.input_prompt, end="", flush=True)
-    
-    def _print_status(self):
-        """Print status line at fixed position"""
-        # Rate limit
-        if time.time() - self.last_update < 0.1:
-            return
-        self.last_update = time.time()
-        
-        # Build status components
-        meter_level = min(10, int(self.mic_level / 1000))
-        meter = "█" * meter_level + "░" * (10 - meter_level)
-        
-        # Mic status
-        if self.mic_level < 300:
-            mic_status = "🔇 Silent"
-        elif self.mic_level < 1000:
-            mic_status = "🔉 Noise"
+    def get_conversation_panel(self):
+        """Create conversation panel with message history"""
+        if not self.conversation_history:
+            content = Text(
+                "💭 Conversation will appear here...\n\n"
+                "🎙️ Speak to Ada or use the input commands below", 
+                style="dim", justify="center")
         else:
-            mic_status = "🔊 SPEAKING"
+            content = Text()
+            # Show recent messages
+            recent_messages = self.conversation_history[-self.max_messages:]
+            for role, text, timestamp in recent_messages:
+                if role == "user":
+                    content.append(f"[{timestamp}] ", style="dim")
+                    content.append("👤 You: ", style="cyan bold")
+                    content.append(f"{text}\n", style="cyan")
+                elif role == "agent":
+                    content.append(f"[{timestamp}] ", style="dim")
+                    content.append("🤖 Ada: ", style="green bold")
+                    content.append(f"{text}\n", style="green")
+                elif role == "system":
+                    content.append(f"[{timestamp}] ", style="dim")
+                    content.append("ℹ️  ", style="yellow")
+                    content.append(f"{text}\n", style="yellow")
+                content.append("\n")
         
-        # Agent status
-        if self.agent_speaking:
-            agent_status = "🤖 AGENT SPEAKING"
-        else:
-            agent_status = "👂 AGENT LISTENING"
+        return Panel(
+            content,
+            title="Conversation",
+            border_style="white",
+            box=box.ROUNDED
+        )
         
-        # Status line
-        status_line = (f"{mic_status} [{meter}] {self.mic_level:4d} | "
-                      f"{agent_status} | {self.connection_status}")
+    def get_footer_panel(self):
+        """Create footer panel with instructions"""
+        footer_text = Text()
+        footer_text.append("📝 INPUT METHODS:\n", style="bold yellow")
+        footer_text.append("  🎤 Voice: ", style="green")
+        footer_text.append("Speak naturally (default)\n", style="white")
+        footer_text.append("  💬 Text: ", style="cyan")
+        footer_text.append("Press 't' + Enter, then type message + Enter\n", style="white")
+        footer_text.append("  📋 Commands: ", style="magenta")
+        footer_text.append("'h' for help, 'q' to quit", style="white")
         
-        # Update status at fixed position (line 27)
-        print(f"\033[27;1H\033[K{status_line[:60]}", end="", flush=True)
+        return Panel(
+            footer_text,
+            title="Controls",
+            border_style="cyan",
+            box=box.ROUNDED
+        )
         
-        # Return cursor to input line
-        print(f"\033[28;{len(self.input_prompt)+1}H", end="", flush=True)
+    def update_layout(self):
+        """Update the layout with current content"""
+        self.layout["header"].update(self.get_header_panel())
+        self.layout["main"].update(self.get_conversation_panel())
+        self.layout["footer"].update(self.get_footer_panel())
+        
+    def add_message(self, role: str, text: str):
+        """Add a message to the conversation history"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.conversation_history.append((role, text, timestamp))
+        
+    def update_status(self, status: str):
+        """Update the status text"""
+        self.status_text = status
 
 
-def setup_logging(log_level: str = "INFO", log_file: str = None):
+class EnhancedVoiceClient(VoiceClient):
+    """Enhanced voice client with chat integration"""
+    
+    def __init__(self, status, chat_interface, conversation_callback=None):
+        super().__init__(status, conversation_callback)
+        self.chat_interface = chat_interface
+        
+    async def send_text_message(self, message: str):
+        """Override to show sent messages in chat"""
+        await super().send_text_message(message)
+        self.chat_interface.add_message("user", f"💬 {message}")
+
+
+def setup_logging(log_level: str) -> str:
     """Setup logging configuration"""
-    if not log_file:
-        log_file = f"logs/client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    if not os.path.exists("logs"):
+        os.makedirs("logs")
     
-    # Create logs directory
-    Path("logs").mkdir(exist_ok=True)
+    log_file = (f"logs/client_enhanced_"
+               f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     
-    # Configure logging to file only (no console output)
+    # Configure logging - file only, suppress all console output
     logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
+        level=getattr(logging, log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
-        ]
+            logging.FileHandler(log_file)
+        ],
+        force=True  # Force reconfiguration to override any existing handlers
     )
+    
+    # Suppress all logging to console by setting root logger handlers
+    root_logger = logging.getLogger()
+    root_logger.handlers = [logging.FileHandler(log_file)]
+    
+    # Also suppress specific loggers that might be noisy
+    logging.getLogger("livekit").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
     
     return log_file
 
 
-def handle_input(conversation: ConversationDisplay, client, loop):
-    """Handle user input in a separate thread"""
-    while True:
-        try:
-            user_input = input()
-            if user_input.strip():
-                conversation.add_user_message(user_input.strip())
-                # Send text message to agent for LLM processing
-                asyncio.run_coroutine_threadsafe(
-                    client.send_text_message(user_input.strip()), loop
-                )
-        except (EOFError, KeyboardInterrupt):
-            break
-
-
-def main():
-    """Main CLI entry point"""
+async def main():
+    """Enhanced main function with chat interface"""
     parser = argparse.ArgumentParser(
-        description="Ada Voice Client - Clean Interface",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s                    # Connect to default room
-  %(prog)s --room my-room     # Connect to specific room
-  %(prog)s --debug           # Enable debug logging
-        """
-    )
-    
+        description="Ada Voice Client - Enhanced Chat")
+    parser.add_argument("--room", default="test-room", 
+                       help="LiveKit room name")
     parser.add_argument(
-        "--room",
-        default="ada-room",
-        help="LiveKit room name to join (default: ada-room)"
-    )
-    
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level (default: INFO)"
-    )
-    
-    parser.add_argument(
-        "--log-file",
-        help="Log file path (default: logs/client_TIMESTAMP.log)"
-    )
-    
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug mode (equivalent to --log-level DEBUG)"
-    )
-    
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Use Rich-based GUI interface (if available)"
-    )
+        "--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO", help="Logging level")
     
     args = parser.parse_args()
     
-    if args.debug:
-        args.log_level = "DEBUG"
-    
     # Setup logging
-    log_file = setup_logging(args.log_level, args.log_file)
+    log_file = setup_logging(args.log_level)
+    logger = logging.getLogger(__name__)
     
-    async def run_client():
-        # Get the current event loop
-        loop = asyncio.get_event_loop()
+    # Create chat interface
+    chat_interface = ChatInterface()
+    
+    # Create conversation callback to capture voice interactions
+    def conversation_callback(role, text):
+        """Callback to capture conversation from voice client"""
+        if role == "user":
+            chat_interface.add_message("user", f"🎤 {text}")
+        elif role == "agent":
+            chat_interface.add_message("agent", text)
+    
+    # Create enhanced status display and client
+    status = StatusDisplay()
+    client = EnhancedVoiceClient(status, chat_interface, conversation_callback)
+    chat_interface.client = client
+    
+    # Input handling with proper terminal management
+    def handle_input():
+        """Handle keyboard input in a separate thread"""
+        console = Console()
         
-        # Setup display components
-        conversation = ConversationDisplay()
-        status = ImprovedStatusDisplay(conversation)
-        client = CleanVoiceClient(status, conversation)
+        # Print instructions outside Rich interface
+        console.print("\n" + "="*60, style="cyan")
+        console.print("🎯 ADA VOICE CLIENT - ENHANCED CHAT", style="bold blue")
+        console.print("="*60, style="cyan")
+        console.print(f"Room: {args.room}", style="white")
+        console.print(f"Log file: {log_file}", style="dim")
+        console.print("="*60, style="cyan")
+        console.print()
+        console.print("INPUT COMMANDS:", style="bold yellow")
+        console.print("  t + Enter  - Enter text input mode", style="cyan")
+        console.print("  h + Enter  - Show help", style="green")
+        console.print("  q + Enter  - Quit", style="red")
+        console.print("  Ctrl+C     - Force quit", style="red")
+        console.print("="*60, style="cyan")
+        console.print()
         
-        # Start input handler thread (only in non-GUI mode)
-        if not args.gui:
-            input_thread = threading.Thread(
-                target=handle_input,
-                args=(conversation, client, loop),
-                daemon=True
-            )
-            input_thread.start()
-        else:
-            conversation.add_system_message("📝 GUI Mode: Text input temporarily disabled")
-            conversation.add_system_message("🎤 Voice input is active - speak to Ada")
+        import sys
+        import select
+        import termios
+        import tty
         
-        conversation.add_system_message(f"Connecting to room: {args.room}")
-        conversation.add_system_message(f"Logging to: {log_file}")
-        
-        if args.gui:
-            conversation.add_system_message("🎨 Enhanced GUI mode enabled")
-        
-        # Debug client state before connection
-        conversation.add_system_message(f"🔍 Debug: client.connected = {client.connected}")
+        def get_char():
+            """Get a single character from stdin"""
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(sys.stdin.fileno())
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            return ch, old_settings
         
         try:
-            conversation.add_system_message("🔗 Starting connection process...")
-            await client.connect(args.room)
-            conversation.add_system_message("✅ Voice connection established")
-            conversation.add_system_message("💬 Text input ready - type and press Enter")
-            
-            # Debug client state after connection
-            conversation.add_system_message(f"🔍 Debug: client.connected after connect = {client.connected}")
-            
-            # Wait a moment for connection to fully establish
-            await asyncio.sleep(2)
-            
-            # Debug client state after wait
-            conversation.add_system_message(f"🔍 Debug: client.connected after wait = {client.connected}")
-            
-            if not client.connected:
-                conversation.add_system_message("❌ Connection failed to establish")
-                conversation.add_system_message("⚠️ Will keep running anyway for debugging")
-                # Don't return, keep running for debugging
-            else:
-                conversation.add_system_message("🟢 Client ready - connection stable")
-            
-            # Keep running with fallback and additional debugging
-            conversation.add_system_message("🔄 Entering main client loop...")
-            loop_count = 0
-            try:
-                while client.connected:
-                    loop_count += 1
-                    if loop_count % 10 == 0:  # Log every 10 seconds
-                        conversation.add_system_message(f"🔄 Client running (loop {loop_count})")
-                    await asyncio.sleep(1)
+            while True:
+                # Check for input (non-blocking)
+                if select.select([sys.stdin], [], [], 0.1) == ([sys.stdin], [], []):
+                    char, old_settings = get_char()
                     
-                conversation.add_system_message("⚠️ Main loop exited - client.connected became False")
+                    if char == 't':
+                        # Text input mode
+                        console.print("\n📝 TEXT INPUT MODE - Type your message:", 
+                                    style="cyan bold")
+                        console.print("(Press Enter to send, Ctrl+C to cancel)", 
+                                    style="dim")
+                        try:
+                            # Restore normal terminal for input
+                            termios.tcsetattr(sys.stdin.fileno(), 
+                                            termios.TCSADRAIN, old_settings)
+                            message = input("Message: ").strip()
+                            if message:
+                                # Send the message
+                                asyncio.run_coroutine_threadsafe(
+                                    client.send_text_message(message), 
+                                    asyncio.get_event_loop()
+                                )
+                                console.print(f"✅ Sent: {message}", 
+                                             style="green")
+                        except (EOFError, KeyboardInterrupt):
+                            console.print("❌ Cancelled", style="red")
+                    
+                    elif char == 'h':
+                        console.print("\n📋 HELP:", style="yellow bold")
+                        console.print("  Voice Input: Just speak naturally", 
+                                    style="green")
+                        console.print("  Text Input: Press 't' then Enter, type message", 
+                                    style="cyan")
+                        console.print("  Help: Press 'h' then Enter", 
+                                    style="yellow")
+                        console.print("  Quit: Press 'q' then Enter or Ctrl+C", 
+                                    style="red")
+                    
+                    elif char == 'q':
+                        console.print("\n👋 Quitting...", style="yellow")
+                        break
+                        
+                time.sleep(0.1)
                 
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                conversation.add_system_message(f"⚠️ Loop error: {e}, keeping client alive")
-                # Fallback: keep running indefinitely
-                fallback_count = 0
-                while True:
-                    fallback_count += 1
-                    if fallback_count % 10 == 0:
-                        conversation.add_system_message(f"🔄 Fallback mode (loop {fallback_count})")
-                    await asyncio.sleep(1)
-                
-        except Exception as e:
-            conversation.add_system_message(f"❌ Connection error: {e}")
-            import traceback
-            conversation.add_system_message(f"❌ Traceback: {traceback.format_exc()}")
+        except KeyboardInterrupt:
+            console.print("\n👋 Interrupted, quitting...", style="yellow")
     
     try:
-        asyncio.run(run_client())
+        chat_interface.add_message(
+            "system", f"Starting Ada Voice Client (Room: {args.room})")
+        chat_interface.add_message("system", f"Logs: {log_file}")
+        
+        # Start input handler in separate thread
+        input_thread = threading.Thread(target=handle_input, daemon=True)
+        input_thread.start()
+        
+        # Create live display with slower refresh to reduce conflicts
+        with Live(chat_interface.layout, refresh_per_second=2, screen=True):
+            chat_interface.update_status("🔗 Connecting to Ada...")
+            chat_interface.update_layout()
+            
+            # Connect to Ada
+            await client.connect(args.room)
+            
+            chat_interface.update_status("✅ Connected - Voice & Text Ready")
+            chat_interface.add_message(
+                "system",
+                "Connected! You can now speak to Ada or use text input")
+            chat_interface.update_layout()
+            
+            # Main loop with reduced update frequency
+            while (client.room.connection_state == 
+                   client.room.ConnectionState.CONN_CONNECTED):
+                # Update display less frequently
+                chat_interface.update_layout()
+                await asyncio.sleep(0.5)  # 2fps instead of 4fps
+                
     except KeyboardInterrupt:
-        print("\n\n👋 Disconnecting...")
-        print("✅ Client stopped")
+        chat_interface.add_message("system", "Disconnecting...")
+        chat_interface.update_layout()
     except Exception as e:
-        print(f"\n❌ Error: {e}")
-        sys.exit(1)
+        logger.error("Error: %s", e)
+        chat_interface.add_message("system", f"Error: {e}")
+        chat_interface.update_layout()
+    finally:
+        if hasattr(client, 'disconnect'):
+            await client.disconnect()
+        chat_interface.add_message("system", "Client stopped")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

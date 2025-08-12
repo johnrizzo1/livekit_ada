@@ -50,39 +50,39 @@ Examples:
   %(prog)s --debug           # Enable debug logging
         """
     )
-    
+
     parser.add_argument(
         "--room",
         default="ada-room",
         help="LiveKit room name to join (default: ada-room)"
     )
-    
+
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
         help="Logging level (default: INFO)"
     )
-    
+
     parser.add_argument(
         "--log-file",
         help="Log file path (default: logs/agent_TIMESTAMP.log)"
     )
-    
+
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (equivalent to --log-level DEBUG)"
     )
-    
+
     args = parser.parse_args()
-    
+
     if args.debug:
         args.log_level = "DEBUG"
-    
+
     # Setup logging
     log_file = setup_logging(args.log_level, args.log_file)
-    
+
     # Print startup banner
     print("🚀 Ada - Local Voice AI Agent")
     print("=" * 50)
