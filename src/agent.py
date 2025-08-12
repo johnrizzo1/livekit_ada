@@ -12,19 +12,13 @@ import time
 from datetime import datetime
 import queue
 
-# Add the parent directory to the Python path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from src.local_stt import LocalWhisperSTT
-from src.local_tts import LocalPiperTTS
+from .local_stt import LocalWhisperSTT
+from .local_tts import LocalPiperTTS
 from livekit.plugins import openai
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logger will be configured by main CLI
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +31,7 @@ class StatusIndicator:
         self.is_transcribing = False
         self.is_thinking = False
         self.is_speaking = False
+        self.is_dictating = False
         self.last_update = time.time()
         
     def update_audio_level(self, rms):
@@ -64,6 +59,11 @@ class StatusIndicator:
         self.is_speaking = speaking
         self._print_status()
         
+    def set_dictating(self, dictating):
+        """Set dictation mode status"""
+        self.is_dictating = dictating
+        self._print_status()
+        
     def _print_status(self):
         """Print current status line"""
         # Rate limit updates
@@ -85,6 +85,8 @@ class StatusIndicator:
             
         # Pipeline status
         pipeline_parts = []
+        if self.is_dictating:
+            pipeline_parts.append("📝 DICTATING")
         if self.is_recording:
             pipeline_parts.append("🔴 RECORDING")
         if self.is_transcribing:
@@ -105,8 +107,9 @@ class StatusIndicator:
 
 
 class ConversationAgent:
-    def __init__(self, status):
+    def __init__(self, status, conversation_callback=None):
         self.status = status
+        self.conversation_callback = conversation_callback
         self.stt = None
         self.tts = None
         self.llm = None
@@ -116,6 +119,12 @@ class ConversationAgent:
         self.speech_count = 0
         self.pre_buffer = []
         self.is_agent_speaking = False  # Track when agent is speaking
+        
+        # Dictation state
+        self.is_dictating = False
+        self.dictation_text = ""
+        self.dictation_filename = None
+        
         self.messages = [
             {
                 "role": "system",
@@ -158,6 +167,107 @@ class ConversationAgent:
         )
         
         print("✅ All components initialized\n")
+    
+    def detect_dictation_commands(self, text):
+        """Detect dictation commands in user text"""
+        text_lower = text.lower().strip()
+        
+        # Start dictation commands
+        start_phrases = [
+            "ada, start dictation",
+            "ada, take dictation",
+            "ada, begin dictation",
+            "start dictation",
+            "take dictation"
+        ]
+        
+        for phrase in start_phrases:
+            if phrase in text_lower:
+                return "start_dictation", None
+        
+        # Save dictation commands - extract filename
+        if "ada, save dictation" in text_lower or "save dictation" in text_lower:
+            # Try to extract filename
+            parts = text_lower.split("as ")
+            if len(parts) > 1:
+                filename = parts[-1].strip()
+                # Clean up filename
+                filename = filename.replace(".", "").replace(",", "")
+                if not filename.endswith(".txt"):
+                    filename += ".txt"
+                return "save_dictation", filename
+            else:
+                return "save_dictation", "dictation.txt"
+        
+        # Cancel dictation commands
+        cancel_phrases = [
+            "ada, cancel dictation",
+            "ada, stop dictation",
+            "cancel dictation",
+            "stop dictation"
+        ]
+        
+        for phrase in cancel_phrases:
+            if phrase in text_lower:
+                return "cancel_dictation", None
+                
+        return None, None
+    
+    def start_dictation(self):
+        """Start dictation mode"""
+        self.is_dictating = True
+        self.dictation_text = ""
+        self.status.set_dictating(True)
+        logger.info("Started dictation mode")
+        
+    def add_to_dictation(self, text):
+        """Add text to current dictation"""
+        if self.is_dictating:
+            if self.dictation_text:
+                self.dictation_text += " " + text
+            else:
+                self.dictation_text = text
+            logger.info(f"Added to dictation: {text}")
+    
+    def save_dictation(self, filename="dictation.txt"):
+        """Save dictation to file and end dictation mode"""
+        if not self.is_dictating:
+            return False, "Not in dictation mode"
+            
+        if not self.dictation_text.strip():
+            return False, "No dictation content to save"
+        
+        try:
+            # Create dictations directory if it doesn't exist
+            dictations_dir = Path("dictations")
+            dictations_dir.mkdir(exist_ok=True)
+            
+            # Save to file
+            file_path = dictations_dir / filename
+            with open(file_path, 'w') as f:
+                f.write(self.dictation_text.strip())
+            
+            # End dictation mode
+            self.is_dictating = False
+            self.status.set_dictating(False)
+            
+            logger.info(f"Saved dictation to {file_path}")
+            return True, str(file_path)
+            
+        except Exception as e:
+            logger.error(f"Error saving dictation: {e}")
+            return False, f"Error saving file: {e}"
+    
+    def cancel_dictation(self):
+        """Cancel dictation mode without saving"""
+        if not self.is_dictating:
+            return False, "Not in dictation mode"
+            
+        self.is_dictating = False
+        self.dictation_text = ""
+        self.status.set_dictating(False)
+        logger.info("Cancelled dictation mode")
+        return True, "Dictation cancelled"
         
     def start_recording(self):
         """Start recording audio"""
@@ -212,10 +322,14 @@ class ConversationAgent:
             
             if segments:
                 text = " ".join(segment.text.strip() for segment in segments)
-                print(f"\n💬 USER: {text}")
+                logger.info(f"User said: {text}")
+                if self.conversation_callback:
+                    self.conversation_callback("user", text)
+                else:
+                    print(f"\n💬 USER: {text}")
                 return text
             else:
-                logger.warning("No transcription result")
+                logger.warning("No transcription result - empty segments")
                 return None
                 
         except Exception as e:
@@ -270,26 +384,52 @@ class ConversationAgent:
             
             response_text = ""
             async for chunk in response_stream:
-                # Handle LiveKit ChatChunk format (different from OpenAI)
-                if hasattr(chunk, 'content') and chunk.content:
+                # Debug the chunk format
+                logger.debug(f"LLM chunk received: {type(chunk)} - {chunk}")
+                
+                # Handle LiveKit ChatChunk format with delta - this is what we're getting!
+                if hasattr(chunk, 'delta') and chunk.delta and hasattr(chunk.delta, 'content') and chunk.delta.content:
+                    content = chunk.delta.content
+                    logger.debug(f"Using chunk.delta.content: {content}")
+                    response_text += content
+                # Handle LiveKit ChatChunk format
+                elif hasattr(chunk, 'content') and chunk.content:
+                    logger.debug(f"Using chunk.content: {chunk.content}")
                     response_text += chunk.content
+                # Handle OpenAI-style streaming format (used by Ollama)
                 elif hasattr(chunk, 'choices') and chunk.choices and len(chunk.choices) > 0:
-                    # Fallback for OpenAI-style format
                     choice = chunk.choices[0]
                     if hasattr(choice, 'delta') and choice.delta:
                         if hasattr(choice.delta, 'content') and choice.delta.content:
-                            if isinstance(choice.delta.content, str):
-                                response_text += choice.delta.content
-                            elif isinstance(choice.delta.content, list):
-                                for content_item in choice.delta.content:
+                            content = choice.delta.content
+                            logger.debug(f"Using choice.delta.content: {content}")
+                            if isinstance(content, str):
+                                response_text += content
+                            elif isinstance(content, list):
+                                for content_item in content:
                                     if isinstance(content_item, str):
                                         response_text += content_item
                                     elif hasattr(content_item, 'text') and content_item.text:
                                         response_text += content_item.text
+                # Handle direct text chunks
+                elif hasattr(chunk, 'text') and chunk.text:
+                    logger.debug(f"Using chunk.text: {chunk.text}")
+                    response_text += chunk.text
+                # Handle message format
+                elif hasattr(chunk, 'message') and chunk.message:
+                    if hasattr(chunk.message, 'content') and chunk.message.content:
+                        logger.debug(f"Using chunk.message.content: {chunk.message.content}")
+                        response_text += chunk.message.content
+                else:
+                    logger.debug(f"Unhandled chunk format: {dir(chunk)}")
             
             if response_text:
                 self.messages.append({"role": "assistant", "content": response_text})
-                print(f"🤖 ADA: {response_text}")
+                logger.info(f"Agent responded: {response_text}")
+                if self.conversation_callback:
+                    self.conversation_callback("agent", response_text)
+                else:
+                    print(f"🤖 ADA: {response_text}")
                 return response_text
                 
         except Exception as e:
@@ -354,10 +494,10 @@ async def run_agent(room_name="test-room"):
         
         audio_stream = rtc.AudioStream(track)
         
-        # Thresholds
-        SPEECH_THRESHOLD = 200
-        MIN_SPEECH_FRAMES = 20  # 0.4 seconds
-        MAX_SILENCE_FRAMES = 40  # 0.8 seconds
+        # Thresholds - more sensitive to actual speech
+        SPEECH_THRESHOLD = 500  # Increased to avoid noise triggering
+        MIN_SPEECH_FRAMES = 10  # 0.2 seconds - shorter to catch quick speech
+        MAX_SILENCE_FRAMES = 30  # 0.6 seconds - shorter pause detection
         
         frame_count = 0
         
@@ -381,9 +521,11 @@ async def run_agent(room_name="test-room"):
                 # Update status display
                 status.update_audio_level(rms)
                 
-                # Log periodically
+                # Log periodically with more detail
                 if frame_count % 100 == 0:  # Every 2 seconds
-                    logger.info(f"Audio stats - Frame {frame_count}, RMS: {rms}, Speech count: {agent.speech_count}, Recording: {agent.is_recording}, Agent speaking: {agent.is_agent_speaking}")
+                    logger.info(f"Frame {frame_count}: RMS={rms}, Speech={agent.speech_count}, "
+                              f"Silence={agent.silence_count}, Recording={agent.is_recording}, "
+                              f"AgentSpeaking={agent.is_agent_speaking}")
                 
                 # Skip processing if agent is speaking
                 if agent.is_agent_speaking:
@@ -426,28 +568,71 @@ async def run_agent(room_name="test-room"):
                             audio_to_process = agent.stop_recording(detected_sample_rate)
                             agent.speech_count = 0
                             
-                            if audio_to_process is not None and len(audio_to_process) > 8000:
+                            if audio_to_process is not None and len(audio_to_process) > 3200:
+                                logger.info(f"Processing audio: {len(audio_to_process)} samples")
                                 # Transcribe
                                 text = await agent.transcribe(audio_to_process, detected_sample_rate)
                                 
                                 if text and len(text) > 2:
-                                    # Generate response
-                                    response = await agent.generate_response(text)
+                                    logger.info(f"STT SUCCESS: '{text}' - proceeding to LLM")
+                                    # Check if in dictation mode
+                                    if agent.is_dictating:
+                                        # Check for dictation commands
+                                        command, param = agent.detect_dictation_commands(text)
+                                        
+                                        if command == "save_dictation":
+                                            success, result = agent.save_dictation(param)
+                                            if success:
+                                                response = f"Dictation saved to {result}"
+                                            else:
+                                                response = f"Failed to save dictation: {result}"
+                                        elif command == "cancel_dictation":
+                                            success, result = agent.cancel_dictation()
+                                            response = result
+                                        else:
+                                            # Add to dictation
+                                            agent.add_to_dictation(text)
+                                            continue  # Don't generate response, just continue listening
+                                    else:
+                                        # Check for start dictation command
+                                        command, param = agent.detect_dictation_commands(text)
+                                        
+                                        if command == "start_dictation":
+                                            agent.start_dictation()
+                                            response = "Starting dictation. Please begin speaking. Say 'Ada, save dictation as filename' when finished."
+                                        else:
+                                            # Normal conversation mode
+                                            logger.info(f"Sending to LLM: '{text}'")
+                                            response = await agent.generate_response(text)
+                                            logger.info(f"LLM response received: '{response}'")
                                     
                                     if response:
-                                        # Speak response
+                                        # Speak response - Set speaking flag EARLY
                                         agent.is_agent_speaking = True
                                         status.set_speaking(True)
+                                        logger.info("Agent started speaking - blocking audio processing")
+                                        
                                         try:
                                             tts_result = await agent.tts.synthesize(response)
                                             await audio_queue.put(tts_result.frame)
-                                            # Wait a bit for audio to finish playing
-                                            await asyncio.sleep(len(tts_result.frame.data) / (48000 * 2 * 1.2))  # duration + 20% buffer
+                                            
+                                            # Calculate actual audio duration with more accurate timing
+                                            audio_duration = len(tts_result.frame.data) / (48000 * 2)  # 48kHz, 16-bit
+                                            buffer_time = max(1.0, audio_duration * 1.2)  # Reduced buffer: 1 second minimum or 20% extra
+                                            
+                                            logger.info(f"Audio duration: {audio_duration:.2f}s, waiting {buffer_time:.2f}s for playback + echo clearance")
+                                            await asyncio.sleep(buffer_time)
+                                            
                                         except Exception as e:
                                             logger.error(f"TTS error: {e}")
+                                            # Even on error, wait a bit to prevent immediate processing
+                                            await asyncio.sleep(1.0)
                                         finally:
+                                            # Reduced extra delay to prevent long blocking
+                                            await asyncio.sleep(0.5)  # Reduced from 1.0 to 0.5 seconds
                                             agent.is_agent_speaking = False
                                             status.set_speaking(False)
+                                            logger.info("Agent finished speaking - resuming audio processing")
     
     # Event handlers
     @room.on("connected")
@@ -463,6 +648,83 @@ async def run_agent(room_name="test-room"):
             if publication.kind == rtc.TrackKind.KIND_AUDIO and publication.track:
                 print(f"   🎤 Found existing audio track, processing...")
                 asyncio.create_task(process_audio(publication.track, participant))
+                
+    @room.on("data_received")
+    def on_data_received(data: rtc.DataPacket):
+        """Handle incoming text messages from clients"""
+        try:
+            message = data.data.decode('utf-8')
+            participant_identity = data.participant.identity if data.participant else "unknown"
+            
+            logger.info(f"Received text message from {participant_identity}: {message}")
+            print(f"\n💬 Text from {participant_identity}: {message}")
+            
+            # Process the text message through the LLM pipeline
+            async def process_text_message():
+                try:
+                    if message.strip():
+                        # Check for dictation commands
+                        if agent.is_dictating:
+                            command, param = agent.detect_dictation_commands(message)
+                            
+                            if command == "save_dictation":
+                                success, result = agent.save_dictation(param)
+                                if success:
+                                    response = f"Dictation saved to {result}"
+                                else:
+                                    response = f"Failed to save dictation: {result}"
+                            elif command == "cancel_dictation":
+                                success, result = agent.cancel_dictation()
+                                response = result
+                            else:
+                                # Add to dictation
+                                agent.add_to_dictation(message)
+                                return  # Don't generate response
+                        else:
+                            # Check for start dictation command
+                            command, param = agent.detect_dictation_commands(message)
+                            
+                            if command == "start_dictation":
+                                agent.start_dictation()
+                                response = "Starting dictation. Please begin speaking. Say 'Ada, save dictation as filename' when finished."
+                            else:
+                                # Normal conversation mode - process through LLM
+                                response = await agent.generate_response(message)
+                        
+                        if response:
+                            # Speak the response
+                            agent.is_agent_speaking = True
+                            status.set_speaking(True)
+                            logger.info("Agent started speaking (text response)")
+                            
+                            try:
+                                tts_result = await agent.tts.synthesize(response)
+                                await audio_queue.put(tts_result.frame)
+                                
+                                # Calculate timing
+                                audio_duration = len(tts_result.frame.data) / (48000 * 2)
+                                buffer_time = max(2.0, audio_duration * 2.0)
+                                
+                                logger.info(f"Text response audio duration: {audio_duration:.2f}s, waiting {buffer_time:.2f}s")
+                                await asyncio.sleep(buffer_time)
+                                
+                            except Exception as e:
+                                logger.error(f"TTS error for text response: {e}")
+                                await asyncio.sleep(1.0)
+                            finally:
+                                await asyncio.sleep(1.0)  # Extra buffer
+                                agent.is_agent_speaking = False
+                                status.set_speaking(False)
+                                logger.info("Agent finished speaking (text response)")
+                                
+                except Exception as e:
+                    logger.error(f"Error processing text message: {e}")
+            
+            # Run the text processing asynchronously
+            asyncio.create_task(process_text_message())
+            
+        except Exception as e:
+            logger.error(f"Error handling data message: {e}")
     
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant):

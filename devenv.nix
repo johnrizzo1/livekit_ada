@@ -26,12 +26,14 @@
       # Additional tools
       aiohttp
       requests
+      rich
     ]))
   ];
   languages.python.enable = true;
   languages.python.venv.enable = true;
   languages.python.version = "3.12";
   languages.python.venv.requirements = ''
+    livekit
     livekit-agents[assemblyai,openai,rime,silero,turn-detector]
     livekit-plugins-noise-cancellation
   '';

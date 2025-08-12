@@ -13,12 +13,9 @@ import threading
 import queue
 import time
 
-# Add the parent directory to the Python path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# Logger will be configured by main CLI
 logger = logging.getLogger(__name__)
 
 
@@ -74,15 +71,17 @@ class StatusDisplay:
             agent_status = "👂 AGENT LISTENING"
             
         # Status line
-        status_line = f"\r{mic_status} [{meter}] {self.mic_level:4d} | {agent_status} | {self.connection_status}"
+        status_line = (f"\r{mic_status} [{meter}] {self.mic_level:4d} | "
+                      f"{agent_status} | {self.connection_status}")
         print(status_line + " " * 20, end="", flush=True)
 
 
 class VoiceClient:
     """Voice client with status indicators"""
     
-    def __init__(self, status):
+    def __init__(self, status, conversation=None):
         self.status = status
+        self.conversation = conversation
         self.room = rtc.Room()
         self.audio = pyaudio.PyAudio()
         self.mic_stream = None
@@ -90,6 +89,19 @@ class VoiceClient:
         self.audio_queue = queue.Queue()
         self.playback_thread = None
         self.running = True
+        
+    async def send_text_message(self, message: str):
+        """Send text message to agent via data channel"""
+        try:
+            if (self.room.connection_state ==
+                rtc.ConnectionState.CONN_CONNECTED):
+                data = message.encode('utf-8')
+                await self.room.local_participant.publish_data(data)
+                logger.info(f"Sent text message to agent: {message}")
+            else:
+                logger.warning("Cannot send message - not connected to room")
+        except Exception as e:
+            logger.error(f"Error sending text message: {e}")
         
     async def connect(self, room_name: str = "test-room"):
         """Connect to LiveKit room"""
@@ -114,7 +126,8 @@ class VoiceClient:
             self.status.set_connection_status("✅ Connected")
             print(f"\n✅ Connected to room: {room_name}")
             print(f"🔗 Room SID: {self.room.sid}")
-            print(f"🔗 Local participant: {self.room.local_participant.identity}")
+            print(f"🔗 Local participant: "
+                  f"{self.room.local_participant.identity}")
             
             # List participants
             if self.room.remote_participants:
@@ -149,7 +162,9 @@ class VoiceClient:
         
         # Log connection state after connect
         print(f"🔗 Connection state: {self.room.connection_state}")
-        print(f"🔗 Local participant SID: {self.room.local_participant.sid if self.room.local_participant else 'None'}")
+        participant_sid = (self.room.local_participant.sid
+                          if self.room.local_participant else 'None')
+        print(f"🔗 Local participant SID: {participant_sid}")
         
         # Start playback thread
         self.start_playback_thread()
@@ -165,13 +180,15 @@ class VoiceClient:
             while self.running:
                 try:
                     # Get audio from queue
-                    audio_data, sample_rate, channels = self.audio_queue.get(timeout=0.1)
+                    audio_data, sample_rate, channels = (
+                        self.audio_queue.get(timeout=0.1))
                     
                     self.status.set_agent_speaking(True)
                     
                     # Create/update speaker stream
                     if self.speaker_stream is None:
-                        logger.info(f"Creating speaker stream: {sample_rate}Hz, {channels}ch")
+                        logger.info(f"Creating speaker stream: "
+                                   f"{sample_rate}Hz, {channels}ch")
                         self.speaker_stream = self.audio.open(
                             format=pyaudio.paInt16,
                             channels=channels,
@@ -186,7 +203,8 @@ class VoiceClient:
                     # Check audio level
                     audio_array = np.frombuffer(audio_data, dtype=np.int16)
                     rms = int(np.sqrt(np.mean(audio_array.astype(float)**2)))
-                    logger.info(f"Played audio chunk: {len(audio_data)} bytes, {sample_rate}Hz, {channels}ch, RMS: {rms}")
+                    logger.info(f"Played audio chunk: {len(audio_data)} bytes, "
+                               f"{sample_rate}Hz, {channels}ch, RMS: {rms}")
                     
                 except queue.Empty:
                     self.status.set_agent_speaking(False)
@@ -201,7 +219,8 @@ class VoiceClient:
                             pass
                         self.speaker_stream = None
         
-        self.playback_thread = threading.Thread(target=playback_worker, daemon=True)
+        self.playback_thread = threading.Thread(target=playback_worker,
+                                               daemon=True)
         self.playback_thread.start()
         
     async def publish_microphone(self):
@@ -210,9 +229,10 @@ class VoiceClient:
         
         # Create audio source
         audio_source = rtc.AudioSource(16000, 1)
-        audio_track = rtc.LocalAudioTrack.create_audio_track("microphone", audio_source)
+        audio_track = rtc.LocalAudioTrack.create_audio_track(
+            "microphone", audio_source)
         
-        publication = await self.room.local_participant.publish_track(audio_track)
+        await self.room.local_participant.publish_track(audio_track)
         print("📡 Publishing microphone audio")
         
         # Open mic stream
@@ -233,11 +253,13 @@ class VoiceClient:
         while self.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
             try:
                 # Read from mic
-                audio_data = self.mic_stream.read(320, exception_on_overflow=False)
+                audio_data = self.mic_stream.read(
+                    320, exception_on_overflow=False)
                 
                 # Create frame
                 frame = rtc.AudioFrame.create(16000, 1, 320)
-                np.frombuffer(frame.data, dtype=np.int16)[:] = np.frombuffer(audio_data, dtype=np.int16)
+                np.frombuffer(frame.data, dtype=np.int16)[:] = (
+                    np.frombuffer(audio_data, dtype=np.int16))
                 
                 # Send frame
                 await audio_source.capture_frame(frame)
@@ -245,7 +267,8 @@ class VoiceClient:
                 # Update status
                 frame_count += 1
                 if frame_count % 5 == 0:  # Every 100ms
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(float)
+                    audio_array = np.frombuffer(
+                        audio_data, dtype=np.int16).astype(float)
                     rms = int(np.sqrt(np.mean(audio_array**2)))
                     self.status.update_mic_level(rms)
                 
@@ -263,7 +286,8 @@ class VoiceClient:
                 frame = event.frame
                 frame_count += 1
                 if frame_count % 50 == 0:  # Log every 50 frames
-                    logger.info(f"Received {frame_count} audio frames, queue size: {self.audio_queue.qsize()}")
+                    logger.info(f"Received {frame_count} audio frames, "
+                               f"queue size: {self.audio_queue.qsize()}")
                 self.audio_queue.put((
                     bytes(frame.data),
                     frame.sample_rate,
@@ -291,8 +315,10 @@ class VoiceClient:
 
 async def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Voice client with indicators")
-    parser.add_argument("room", nargs="?", default="test-room", help="Room name")
+    parser = argparse.ArgumentParser(
+        description="Voice client with indicators")
+    parser.add_argument("room", nargs="?", default="test-room",
+                       help="Room name")
     args = parser.parse_args()
     
     print("\n🎯 VOICE CLIENT WITH STATUS INDICATORS")
@@ -307,7 +333,8 @@ async def main():
         await client.connect(args.room)
         
         # Keep running
-        while client.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
+        while (client.room.connection_state ==
+               rtc.ConnectionState.CONN_CONNECTED):
             await asyncio.sleep(1)
             
     except KeyboardInterrupt:
